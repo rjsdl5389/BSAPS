@@ -97,22 +97,26 @@ BSAPS는 배터리의 잔존 수명(SOH)을 정밀하게 추정하는 시스템�
 
 ### 4.2 State Machine Diagram
 
-```mermaid
-stateDiagram-v2
-    [*] --> IDLE
+    ```mermaid
+    stateDiagram-v2
+        [*] --> IDLE
 
-    IDLE --> LOAD_ON : Button pressed
-    LOAD_ON --> STRESS : High current detected
-    STRESS --> PROTECT : Stress threshold exceeded
-    PROTECT --> COOLING : Load cut off
-    COOLING --> IDLE : System stabilized
-  ```
+        IDLE --> LOAD_ON : Button pressed
+        LOAD_ON --> STRESS : High current detected
+        STRESS --> PROTECT : Stress threshold exceeded
+        PROTECT --> COOLING : Load cut off
+        COOLING --> IDLE : System stabilized
+    ```
 
 이 구조를 통해 상태 전이 조건을 명확히 정의하고,
 디버깅 및 향후 확장이 용이하도록 설계하였다.
 
-5. Hardware Configuration
-5.1 Main Components
+---
+
+## 5. Hardware Configuration
+
+### 5.1 Main Components
+
 ESP32 Dev Module (ESP32-WROOM-32 계열)
 
 DS18B20 온도 센서
@@ -135,14 +139,18 @@ MOSFET 기반 부하 제어 회로
 
 12V 2A 어댑터 (테스트 전원)
 
-5.2 Test Environment
+### 5.2 Test Environment
+
 현재 단계에서는 실제 배터리 대신 12V 어댑터를 사용하여 테스트
 
 버튼 입력으로 부하를 인가하여 전류 스트레스를 의도적으로 발생
 
 스트레스 조건 충족 시 자동 보호 동작 수행
 
-6. Current Implementation Status
+---
+
+## 6. Current Implementation Status
+
 ESP32 기반 v1 시스템에서 다음 항목이 구현 및 검증되었다.
 
 상태머신 기반 전체 동작 흐름
@@ -157,37 +165,50 @@ ADC floating 문제 해결
 
 로그 출력 기반 상태 추적
 
-정상 동작이 확인된 시점을 기준으로 Baseline을 고정하여
+정상 동작이 확인된 시점을 기준으로 Baseline을 고정하여  
 이후 변경 사항은 해당 기준선 대비 변화 중심으로 관리하고 있다.
 
-7. Repository Structure
-BSAPS/
-├─ firmware/   ESP32 펌웨어 소스 코드
-├─ hardware/   회로 구성 및 배선 정보
-├─ logs/       테스트 및 동작 로그
-├─ docs/       개발 기록 및 문서
-└─ README.md
-docs/dev_history.md
-프로젝트 전반의 개발 과정과 주요 디버깅 이력을 정리한 문서
+---
 
-8. Design Notes
+## 7. Repository Structure
+
+    BSAPS/
+    ├─ firmware/   ESP32 펌웨어 소스 코드
+    ├─ hardware/   회로 구성 및 배선 정보
+    ├─ logs/       테스트 및 동작 로그
+    ├─ docs/       개발 기록 및 문서
+    └─ README.md
+
+    docs/dev_history.md
+    프로젝트 전반의 개발 과정과 주요 디버깅 이력을 정리한 문서
+
+---
+
+## 8. Design Notes
+
 기능 확장보다 시스템 안정성과 판단 흐름의 명확성을 우선한다.
 
 정상 동작 기준선을 명확히 유지하기 위해 Baseline 개념을 사용한다.
 
 하드웨어 특성과 시간 흐름을 고려한 상태머신 설계를 핵심 설계 자산으로 삼는다.
 
-9. Future Work
+---
+
+## 9. Future Work
+
 STM32 기반으로 시스템 포팅
 
 보호 시나리오 및 제어 정밀도 확장
 
 실제 배터리 환경을 고려한 테스트로 확장
 
-10. Summary
-BSAPS는 단순한 센서 연동 프로젝트가 아니라,
-환경 → 상태 → 판단 → 보호로 이어지는
+---
+
+## 10. Summary
+
+BSAPS는 단순한 센서 연동 프로젝트가 아니라,  
+환경 → 상태 → 판단 → 보호로 이어지는  
 임베디드 시스템 설계 사고 과정을 정리한 결과물이다.
 
-본 프로젝트를 통해 상태머신 기반 설계,
+본 프로젝트를 통해 상태머신 기반 설계,  
 하드웨어 안정성 확보, 그리고 기준선 중심 개발의 중요성을 체득하였다.
