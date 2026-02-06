@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Build artifacts
+**/.pio/
+**/build/
+
+# Secrets
+.env
+
+# Logs
+*.log
