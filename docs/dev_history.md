@@ -158,3 +158,11 @@
 본 프로젝트는 센서 연동 실습을 넘어  
 환경, 상태, 판단, 보호로 이어지는 임베디드 시스템 사고 과정을 정리한 결과물이다.  
 Baseline과 상태머신 설계는 이후 프로젝트에도 그대로 적용 가능한 핵심 경험이다.
+
+## 2026-02-06
+
+- INA219 전류 센서 무부하(IDLE, MOSFET OFF) 구간 평균값을 기준으로 current offset 보정 로직 추가
+- 보정된 전류값(I_corr)을 기준으로 STRESS 판단 및 stress score 누적 로직 적용
+- millis() 기반 시간 관리 제거, 1ms 하드웨어 tick ISR 기반 nowMs 구조로 전환
+- 상태머신 LED 동작 정의 정리: STRESS = YELLOW, PROTECT = Red blink(2s)
+- STRESS 구간에서 노랑이 붉게 보이는 현상 확인, RGB LED 밝기 불균형 또는 소자 특성에 기인한 것으로 판단
