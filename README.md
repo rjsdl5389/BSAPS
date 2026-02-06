@@ -95,19 +95,26 @@ BSAPS는 배터리의 잔존 수명(SOH)을 정밀하게 추정하는 시스템�
 - IDLE (Return)  
   조건 만족 시 초기 상태로 복귀
 
-### 4.2 State Machine Diagram
+## 4.2 State Machine Diagram
 
-    ```mermaid
-    stateDiagram-v2
-        [*] --> IDLE
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
 
-        IDLE --> LOAD_ON : Button pressed
-        LOAD_ON --> STRESS : High current detected
-        STRESS --> PROTECT : Stress threshold exceeded
-        PROTECT --> COOLING : Load cut off
-        COOLING --> IDLE : System stabilized
-    ```
+    IDLE --> LOAD_ON : Button pressed & Power valid
+    LOAD_ON --> STRESS : Button held
 
+    STRESS --> PROTECT : Stress score limit
+    STRESS --> PROTECT : Temperature limit
+    STRESS --> PROTECT : Max scenario time
+
+    LOAD_ON --> IDLE : Button released
+    STRESS --> IDLE : Button released
+    STRESS --> IDLE : Power lost
+
+    PROTECT --> COOLING : 2s elapsed
+    COOLING --> IDLE : Cooling elapsed
+```
 이 구조를 통해 상태 전이 조건을 명확히 정의하고,
 디버깅 및 향후 확장이 용이하도록 설계하였다.
 
