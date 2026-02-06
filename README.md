@@ -106,6 +106,7 @@ stateDiagram-v2
     STRESS --> PROTECT : Stress threshold exceeded
     PROTECT --> COOLING : Load cut off
     COOLING --> IDLE : System stabilized
+
 이 구조를 통해 상태 전이 조건을 명확히 정의하고,
 디버깅 및 향후 확장이 용이하도록 설계하였다.
 
