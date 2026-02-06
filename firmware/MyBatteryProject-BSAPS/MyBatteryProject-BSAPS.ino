@@ -10,16 +10,25 @@
 #define I2C_SCL          22
 #define MOSFET_GATE_PIN  25
 #define BUTTON_PIN       33   // INPUT_PULLUP, pressed = LOW
-#define LED_R_PIN  26
-#define LED_G_PIN  27
-#define LED_B_PIN  14
+#define LED_R_PIN        26
+#define LED_G_PIN        27
+#define LED_B_PIN        14
 
-
-// ====== Timing ======
+// ====== Scheduling periods (task rates) ======
+static const uint32_t INA_PERIOD_MS      = 100;    // read INA219 every 100ms
 static const uint32_t LOG_PERIOD_MS      = 500;    // print every 500ms
-static const uint32_t TEMP_PERIOD_MS     = 1000;   // update temp every 1s (hold last for logs)
+static const uint32_t TEMP_PERIOD_MS     = 1000;   // start temp conversion every 1s (async read later)
+
+// DS18B20 conversion time (worst-case 12-bit ~750ms)
+static const uint32_t DS18B20_CONV_MS    = 750;
+
+// ====== Other timings ======
 static const uint32_t COOLING_MS         = 5000;   // stay in COOLING before back to IDLE
 static const uint32_t INIT_WARMUP_MS     = 1500;   // small warmup time
+
+// ====== PROTECT LED blink timing ======
+static const uint32_t PROTECT_BLINK_TOTAL_MS  = 2000;  // blink red for 2 seconds
+static const uint32_t PROTECT_BLINK_PERIOD_MS = 200;   // blink interval (200ms)
 
 // ====== Voltage sensing (just display) ======
 static const float ADC_VREF              = 3.3f;
@@ -50,6 +59,12 @@ static const int PWM_RES_BITS            = 10;      // 0..1023
 static uint32_t lastWarnMs               = 0;
 static const uint32_t WARN_PERIOD_MS     = 500;
 
+// ====== INA219 current offset calibration ======
+static float I_OFFSET_mA = 0.0f;
+static bool  offset_calibrated = false;
+static const int OFFSET_SAMPLE_COUNT = 50;     // 50 samples * 20ms = 1s 정도
+static const uint32_t OFFSET_ARM_DELAY_MS = 300; // IDLE 진입 후 안정화 대기(간단)
+
 // ====== State machine ======
 enum State {
   INIT,
@@ -61,10 +76,7 @@ enum State {
 };
 
 static State gState = INIT;
-
 static uint32_t stateEnterMs = 0;
-static uint32_t lastLogMs = 0;
-static uint32_t lastTempMs = 0;
 
 // Hold-last temperature
 static float lastTempC = NAN;
@@ -85,6 +97,52 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
 Adafruit_INA219 ina219;
 
+// ====== Cached sensor values (updated by scheduler) ======
+static float gBusV  = 0.0f;
+static float gCurmA = 0.0f;      // corrected current (raw - offset)
+static float gCurRawmA = 0.0f;   // raw current (for logging/debug)
+static float gP_mW  = 0.0f;
+
+// ====== DS18B20 async handling ======
+static bool     tempReqPending = false;
+static uint32_t tempReqMs      = 0;
+static uint32_t lastTempKickMs = 0;
+
+// ====== Scheduler timestamps ======
+static uint32_t lastInaMs = 0;
+static uint32_t lastLogMs = 0;
+
+// ====== LED helper ======
+static void setLED(bool r, bool g, bool b) {
+  digitalWrite(LED_R_PIN, r ? HIGH : LOW);
+  digitalWrite(LED_G_PIN, g ? HIGH : LOW);
+  digitalWrite(LED_B_PIN, b ? HIGH : LOW);
+}
+
+// ====== 1ms Tick Timer (HW timer ISR) ======
+static hw_timer_t* gTimer = nullptr;
+static volatile uint32_t gTickMs = 0;
+
+static void ARDUINO_ISR_ATTR onTickISR() {
+  gTickMs++;
+}
+
+static uint32_t nowMs() {
+  return gTickMs;
+}
+
+static void startTickTimer_1ms() {
+  gTimer = timerBegin(1000000); // 1 tick = 1us
+  if (!gTimer) {
+    Serial.println("ERR: timerBegin failed");
+    return;
+  }
+
+  timerAttachInterrupt(gTimer, &onTickISR);
+  timerAlarm(gTimer, 1000, true, 0); // 1000us => 1ms tick
+  timerStart(gTimer);
+}
+
 // ====== Helpers ======
 static const char* stateName(State s) {
   switch (s) {
@@ -102,7 +160,7 @@ static bool isButtonPressed() {
   return (digitalRead(BUTTON_PIN) == LOW);
 }
 
-// ---- PWM control (Arduino-ESP32 core v3.x style) ----
+// ---- PWM control ----
 static void pwmInit() {
   ledcAttach(MOSFET_GATE_PIN, PWM_FREQ_HZ, PWM_RES_BITS);
   ledcWrite(MOSFET_GATE_PIN, 0);
@@ -123,52 +181,48 @@ static void setMosfetOff() {
   setMosfetDuty(0.0f);
 }
 
-static void readIna(float &busV, float &curmA, float &p_mW) {
-  busV  = ina219.getBusVoltage_V();
-  curmA = ina219.getCurrent_mA();
-  p_mW  = ina219.getPower_mW();
+static void readIna(float &busV, float &curRawmA, float &curCorrmA, float &p_mW) {
+  busV     = ina219.getBusVoltage_V();
+  curRawmA = ina219.getCurrent_mA();
+
+  float corr = curRawmA - (offset_calibrated ? I_OFFSET_mA : 0.0f);
+  if (corr < 0.0f) corr = 0.0f;
+  curCorrmA = corr;
+
+  p_mW = ina219.getPower_mW();
 }
 
-static bool isBusVValidStable(uint32_t nowMs, float busV) {
+static bool isBusVValidStable(uint32_t now, float busV) {
   if (busV >= BUSV_VALID_V) {
-    if (busVValidSinceMs == 0) busVValidSinceMs = nowMs;
-    return (nowMs - busVValidSinceMs) >= BUSV_STABLE_MS;
+    if (busVValidSinceMs == 0) busVValidSinceMs = now;
+    return (now - busVValidSinceMs) >= BUSV_STABLE_MS;
   } else {
     busVValidSinceMs = 0;
     return false;
   }
 }
 
-static void updateTemperature(uint32_t nowMs) {
-  if (nowMs - lastTempMs < TEMP_PERIOD_MS) return;
-  lastTempMs = nowMs;
-
-  ds18b20.requestTemperatures();
-  lastTempC = ds18b20.getTempCByIndex(0);
-}
-
-static void updateStressScore(uint32_t nowMs, float curmA) {
-  if (lastScoreMs == 0) lastScoreMs = nowMs;
-  uint32_t dtMs = nowMs - lastScoreMs;
-  lastScoreMs = nowMs;
+static void updateStressScore(uint32_t now, float curmA_corr) {
+  if (lastScoreMs == 0) lastScoreMs = now;
+  uint32_t dtMs = now - lastScoreMs;
+  lastScoreMs = now;
 
   float dtS = dtMs / 1000.0f;
-  float excess = curmA - I_TH_mA;
+  float excess = curmA_corr - I_TH_mA;
 
   if (excess > 0.0f) {
     stressScore_mAs += excess * dtS;
   } else {
-    // small decay (demo-friendly)
     const float decayPerSec = 10.0f; // mA*s per second
     stressScore_mAs -= decayPerSec * dtS;
     if (stressScore_mAs < 0.0f) stressScore_mAs = 0.0f;
   }
 }
 
-static float computeDutyFromHold(uint32_t nowMs) {
+static float computeDutyFromHold(uint32_t now) {
   if (scenarioStartMs == 0) return 0.0f;
 
-  uint32_t heldMs = nowMs - scenarioStartMs;
+  uint32_t heldMs = now - scenarioStartMs;
   float alpha = 1.0f;
 
   if (RAMP_TO_MAX_MS > 0) {
@@ -180,13 +234,13 @@ static float computeDutyFromHold(uint32_t nowMs) {
   return DUTY_MIN + (DUTY_MAX - DUTY_MIN) * alpha;
 }
 
-static void printProtectReason(uint32_t nowMs, float curmA, const char* reason) {
-  float heldSec = (scenarioStartMs == 0) ? 0.0f : (nowMs - scenarioStartMs) / 1000.0f;
+static void printProtectReason(uint32_t now, float curmA_corr, const char* reason) {
+  float heldSec = (scenarioStartMs == 0) ? 0.0f : (now - scenarioStartMs) / 1000.0f;
 
   Serial.print("PROTECT: ");
   Serial.print(reason);
-  Serial.print(" | I=");
-  Serial.print(curmA, 1);
+  Serial.print(" | I_corr=");
+  Serial.print(curmA_corr, 1);
   Serial.print("mA (TH ");
   Serial.print(I_TH_mA, 1);
   Serial.print(") | Score=");
@@ -198,24 +252,21 @@ static void printProtectReason(uint32_t nowMs, float curmA, const char* reason) 
   Serial.println("s -> MOSFET OFF");
 }
 
-static void printWarnNoSupply(uint32_t nowMs, float busV) {
-  if (nowMs - lastWarnMs < WARN_PERIOD_MS) return;
-  lastWarnMs = nowMs;
+static void printWarnNoSupply(uint32_t now, float busV) {
+  if (now - lastWarnMs < WARN_PERIOD_MS) return;
+  lastWarnMs = now;
 
   Serial.print("WARN: NO_SUPPLY (BusV=");
   Serial.print(busV, 3);
   Serial.println("V). Ignore button, stay IDLE.");
 }
 
-static void printLog(uint32_t nowMs, float busV, float curmA, float p_mW) {
-  if (nowMs - lastLogMs < LOG_PERIOD_MS) return;
-  lastLogMs = nowMs;
-
+static void printLog(uint32_t now, float busV, float curRawmA, float curCorrmA, float p_mW) {
   int adcRaw = analogRead(VOLTAGE_PIN);
   float adcV = (float)adcRaw * (ADC_VREF / (float)ADC_MAX);
 
   float heldSec = 0.0f;
-  if (scenarioStartMs != 0) heldSec = (nowMs - scenarioStartMs) / 1000.0f;
+  if (scenarioStartMs != 0) heldSec = (now - scenarioStartMs) / 1000.0f;
 
   Serial.print("S: ");
   Serial.print(stateName(gState));
@@ -230,8 +281,14 @@ static void printLog(uint32_t nowMs, float busV, float curmA, float p_mW) {
   Serial.print(adcV, 2);
   Serial.print(" V | BusV: ");
   Serial.print(busV, 3);
-  Serial.print(" V | I: ");
-  Serial.print(curmA, 2);
+
+  Serial.print(" V | I_raw: ");
+  Serial.print(curRawmA, 2);
+  Serial.print(" mA | I_off: ");
+  Serial.print(I_OFFSET_mA, 2);
+  Serial.print(" mA | I_corr: ");
+  Serial.print(curCorrmA, 2);
+
   Serial.print(" mA | P: ");
   Serial.print(p_mW, 1);
   Serial.print(" mW | Hold: ");
@@ -245,9 +302,9 @@ static void printLog(uint32_t nowMs, float busV, float curmA, float p_mW) {
   Serial.println(")");
 }
 
-static void enterState(State next) {
+static void enterState(State next, uint32_t now) {
   gState = next;
-  stateEnterMs = millis();
+  stateEnterMs = now;
 
   switch (gState) {
     case INIT:
@@ -258,23 +315,17 @@ static void enterState(State next) {
       break;
     case LOAD_ON:
     case STRESS:
-      // duty controlled in logic
       break;
   }
 
   if (gState == LOAD_ON) {
-    scenarioStartMs = millis();
+    scenarioStartMs = now;
     lastScoreMs = scenarioStartMs;
     stressScore_mAs = 0.0f;
     setMosfetDuty(DUTY_MIN);
   }
 
-  if (gState == PROTECT) {
-    // nothing here; PROTECT reason already printed before entering
-  }
-
   if (gState == COOLING) {
-    // Clean for next demo: keep cooling, but reset hold/score display
     scenarioStartMs = 0;
     lastScoreMs = 0;
     stressScore_mAs = 0.0f;
@@ -288,11 +339,14 @@ static void enterState(State next) {
     setMosfetOff();
   }
 
-  switch (gState) {
+  setLED(false, false, false);   // 🔴🟢🔵 전부 OFF → 이전 상태 잔류 제거
+
+  // LED states (PROTECT blink handled in loop)
+switch (gState) {
   case IDLE:     setLED(false, true,  false); break; // Green
   case LOAD_ON:  setLED(true,  true,  false); break; // Yellow
-  case STRESS:   setLED(true,  true,  false); break; // Yellow
-  case PROTECT:  setLED(true,  false, false); break; // Red
+  case STRESS:   setLED(true,  true,  false); break; // Yellow  <-- 원하는 동작
+  case PROTECT:  setLED(true,  false, false); break; // Red (will blink)
   case COOLING:  setLED(false, false, true ); break; // Blue
   case INIT:     setLED(false, false, false); break; // Off
 }
@@ -302,9 +356,52 @@ static void enterState(State next) {
   Serial.println(stateName(gState));
 }
 
+// ====== INA219 offset calibration (IDLE, MOSFET OFF, button not pressed) ======
+static void calibrateCurrentOffset() {
+  float sum = 0.0f;
+
+  for (int i = 0; i < OFFSET_SAMPLE_COUNT; i++) {
+    sum += ina219.getCurrent_mA();
+    delay(20);
+  }
+
+  I_OFFSET_mA = sum / (float)OFFSET_SAMPLE_COUNT;
+  offset_calibrated = true;
+
+  Serial.print("[CAL] I_OFFSET_mA = ");
+  Serial.print(I_OFFSET_mA, 3);
+  Serial.println(" mA");
+}
+
+// ====== DS18B20 async scheduler ======
+static void tempKickIfDue(uint32_t now) {
+  if (!tempReqPending && (now - lastTempKickMs >= TEMP_PERIOD_MS)) {
+    lastTempKickMs = now;
+    ds18b20.requestTemperatures();
+    tempReqPending = true;
+    tempReqMs = now;
+  }
+}
+
+static void tempReadIfReady(uint32_t now) {
+  if (tempReqPending && (now - tempReqMs >= DS18B20_CONV_MS)) {
+    lastTempC = ds18b20.getTempCByIndex(0);
+    tempReqPending = false;
+  }
+}
+
+// ====== PROTECT LED blink handler ======
+static void updateProtectBlinkLED(uint32_t now) {
+  uint32_t elapsed = now - stateEnterMs;
+  bool on = ((elapsed / PROTECT_BLINK_PERIOD_MS) % 2) == 0;
+  setLED(on, false, false);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  Serial.println("BOOT: setup start");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_R_PIN, OUTPUT);
@@ -317,110 +414,139 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
 
   ds18b20.begin();
+  ds18b20.setWaitForConversion(false);
+
   ina219.begin();
 
   pwmInit();
   setMosfetOff();
 
-  enterState(INIT);
+  startTickTimer_1ms();
+
+  delay(20);
+  Serial.print("BOOT: tick=");
+  Serial.println(nowMs());
+
+  uint32_t now = nowMs();
+  enterState(INIT, now);
+
+  Serial.println("BOOT: setup done");
 }
 
 void loop() {
-  uint32_t now = millis();
+  uint32_t now = nowMs();
 
-  updateTemperature(now);
+  // ---- Scheduled tasks ----
+  if (now - lastInaMs >= INA_PERIOD_MS) {
+    lastInaMs = now;
 
-  float busV = 0, curmA = 0, p_mW = 0;
-  readIna(busV, curmA, p_mW);
+    readIna(gBusV, gCurRawmA, gCurmA, gP_mW);
 
-  printLog(now, busV, curmA, p_mW);
+    if (gState == STRESS) {
+      updateStressScore(now, gCurmA); // corrected current
+    }
+  }
 
+  tempKickIfDue(now);
+  tempReadIfReady(now);
+
+  if (now - lastLogMs >= LOG_PERIOD_MS) {
+    lastLogMs = now;
+    printLog(now, gBusV, gCurRawmA, gCurmA, gP_mW);
+  }
+
+  if (gState == PROTECT) {
+    updateProtectBlinkLED(now);
+  }
+
+  // ---- State machine uses cached values ----
   bool pressed = isButtonPressed();
-  bool supplyOK = isBusVValidStable(now, busV);
+  bool supplyOK = isBusVValidStable(now, gBusV);
+
+  // ---- Offset calibration arm (IDLE 안정화 이후 1회만) ----
+  if (gState == IDLE && !offset_calibrated && !pressed && dutyCmd <= 0.0001f) {
+    if ((now - stateEnterMs) >= OFFSET_ARM_DELAY_MS) {
+      calibrateCurrentOffset();
+      // 보정 직후 다음 주기부터 gCurmA가 (raw - offset)로 들어옴
+    }
+  }
 
   switch (gState) {
     case INIT:
       if (now - stateEnterMs >= INIT_WARMUP_MS) {
-        enterState(IDLE);
+        enterState(IDLE, now);
       }
       break;
 
     case IDLE:
       if (pressed) {
         if (!supplyOK) {
-          printWarnNoSupply(now, busV);
+          printWarnNoSupply(now, gBusV);
           setMosfetOff();
         } else {
-          enterState(LOAD_ON);
+          enterState(LOAD_ON, now);
         }
       }
       break;
 
     case LOAD_ON:
       if (!pressed) {
-        enterState(IDLE);
+        enterState(IDLE, now);
         break;
       }
       if (!supplyOK) {
-        printWarnNoSupply(now, busV);
-        enterState(IDLE);
+        printWarnNoSupply(now, gBusV);
+        enterState(IDLE, now);
         break;
       }
-      enterState(STRESS);
+      enterState(STRESS, now);
       break;
 
     case STRESS: {
       if (!pressed) {
-        enterState(IDLE);
+        enterState(IDLE, now);
         break;
       }
       if (!supplyOK) {
-        printWarnNoSupply(now, busV);
-        enterState(IDLE);
+        printWarnNoSupply(now, gBusV);
+        enterState(IDLE, now);
         break;
       }
 
       float duty = computeDutyFromHold(now);
       setMosfetDuty(duty);
 
-      updateStressScore(now, curmA);
-
       bool tempValid = (!isnan(lastTempC) && lastTempC > -100.0f);
       if (tempValid && lastTempC >= TEMP_LIMIT_C) {
-        printProtectReason(now, curmA, "TEMP_LIMIT");
-        enterState(PROTECT);
+        printProtectReason(now, gCurmA, "TEMP_LIMIT");
+        enterState(PROTECT, now);
         break;
       }
 
       if (stressScore_mAs >= SCORE_LIMIT_mAs) {
-        printProtectReason(now, curmA, "SCORE_LIMIT");
-        enterState(PROTECT);
+        printProtectReason(now, gCurmA, "SCORE_LIMIT");
+        enterState(PROTECT, now);
         break;
       }
 
       if (scenarioStartMs != 0 && (now - scenarioStartMs) >= MAX_SCENARIO_MS) {
-        printProtectReason(now, curmA, "MAX_SCENARIO_MS");
-        enterState(PROTECT);
+        printProtectReason(now, gCurmA, "MAX_SCENARIO_MS");
+        enterState(PROTECT, now);
         break;
       }
-
       break;
     }
 
     case PROTECT:
-      enterState(COOLING);
+      if (now - stateEnterMs >= PROTECT_BLINK_TOTAL_MS) {
+        enterState(COOLING, now);
+      }
       break;
 
     case COOLING:
       if (now - stateEnterMs >= COOLING_MS) {
-        enterState(IDLE);
+        enterState(IDLE, now);
       }
       break;
   }
-}
-
-static void setLED(bool r, bool g, bool b) {
-  digitalWrite(LED_R_PIN, r ? HIGH : LOW);
-  digitalWrite(LED_G_PIN, g ? HIGH : LOW);
-  digitalWrite(LED_B_PIN, b ? HIGH : LOW);
 }
