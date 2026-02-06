@@ -100,18 +100,10 @@ BSAPS는 배터리의 잔존 수명(SOH)을 정밀하게 추정하는 시스템�
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
-
-    IDLE --> LOAD_ON : Button pressed & Power valid
+    IDLE --> LOAD_ON : Button pressed
     LOAD_ON --> STRESS : Button held
 
-    STRESS --> PROTECT : Stress score limit
-    STRESS --> PROTECT : Temperature limit
-    STRESS --> PROTECT : Max scenario time
-
-    LOAD_ON --> IDLE : Button released
-    STRESS --> IDLE : Button released
-    STRESS --> IDLE : Power lost
-
+    STRESS --> PROTECT : Stress / Temp / Time limit
     PROTECT --> COOLING : 2s elapsed
     COOLING --> IDLE : Cooling elapsed
 ```
