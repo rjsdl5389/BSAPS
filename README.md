@@ -66,18 +66,19 @@ BSAPS는 배터리의 잔존 수명(SOH)을 정밀하게 추정하는 시스템�
 ## 4. State Machine Design
 
 ### 4.1 State Definitions
-- IDLE: 정상 대기 상태(부하 OFF)
-- LOAD_ON: 버튼 입력으로 부하 인가 시작
-- STRESS: 버튼 홀드 + 전류 기반 스트레스 스코어 누적
-- PROTECT: 임계 도달 시 MOSFET OFF(차단)
-- COOLING: 보호 이후 안정화 시간
+- INIT: 부팅 후 센서 안정화 단계
+- IDLE: 정상 대기 상태 (부하 OFF)
+- STRESS: 버튼 입력에 의해 부하 인가 및 스트레스 스코어 누적
+- PROTECT: 임계 도달 시 MOSFET OFF (자동 차단)
+- COOLING: 보호 이후 일정 시간 대기 후 IDLE 복귀
 
 ### 4.2 State Machine Diagram
 ```mermaid
 stateDiagram-v2
-    [*] --> IDLE
-    IDLE --> LOAD_ON : Button pressed
-    LOAD_ON --> STRESS : Button held
+    [*] --> INIT
+    INIT --> IDLE : warmup elapsed
+
+    IDLE --> STRESS : Button pressed (supply OK)
 
     STRESS --> PROTECT : Score / Temp / Time limit
     PROTECT --> COOLING : 2s elapsed
@@ -115,6 +116,7 @@ Serial log 기반으로 상태 전이와 보호 동작이 정상 동작함을 �
 - Trip: SCORE_LIMIT, Score=121.0 mA*s
 - Protect까지 Hold: 약 9.5 s
 - 보호 후: PROTECT(2s) -> COOLING(5s) -> IDLE
+- Stress score is reset only when returning to IDLE state.
 
 로그:
 - logs/baseline_A1_serial.txt
