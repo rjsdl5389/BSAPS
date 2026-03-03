@@ -82,6 +82,7 @@ stateDiagram-v2
     STRESS --> PROTECT : Score / Temp / Time limit
     PROTECT --> COOLING : 2s elapsed
     COOLING --> IDLE : Cooling elapsed
+```
 
 ---
 
