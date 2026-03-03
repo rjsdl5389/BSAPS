@@ -119,8 +119,8 @@ Serial log 기반으로 상태 전이와 보호 동작이 정상 동작함을 �
 - Stress score is reset only when returning to IDLE state.
 
 로그:
-- logs/baseline_A1_serial.txt
-- logs/baseline_A1_summary.md
+- logs/logsbaseline_A1_serial.txt
+- logs/logsbaseline_A1_summary.md
 
 ---
 
